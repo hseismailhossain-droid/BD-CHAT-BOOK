@@ -1,0 +1,649 @@
+import express from "express";
+import http from "http";
+import path from "path";
+import { WebSocketServer, WebSocket } from "ws";
+import { createServer as createViteServer } from "vite";
+
+interface ClientSession {
+  ws: WebSocket;
+  userCode: string;
+  normCode: string;
+  name: string;
+  lastActive: number;
+}
+
+interface ChatMessage {
+  id: string;
+  senderCode: string;
+  senderName: string;
+  recipientCode: string;
+  content: string;
+  msgType?: 'text' | 'image' | 'video' | 'audio' | 'drawing';
+  mediaUrl?: string;
+  mediaInfo?: {
+    duration?: number;
+    size?: number;
+    name?: string;
+    width?: number;
+    height?: number;
+    mimeType?: string;
+  };
+  drawingData?: string;
+  theme?: string;
+  timestamp: number;
+  sound?: boolean;
+  isEdited?: boolean;
+  editedAt?: number;
+  isDeletedForEveryone?: boolean;
+  deletedAt?: number;
+  ttlSeconds?: number;
+  expiresAt?: number;
+}
+
+const app = express();
+const PORT = 3000;
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+export function normalizeCode(raw: string): string {
+  if (!raw) return "";
+  return raw.replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+}
+
+// In-memory state: key is normalized code (e.g. "845291736")
+const activeClients = new Map<string, ClientSession>();
+// Store message history between pairs: key is sorted pair "CODEA:CODEB"
+const conversationHistory = new Map<string, ChatMessage[]>();
+// Active AnyDesk-style paired sessions: key is "CODEA:CODEB"
+const activePairSessions = new Set<string>();
+
+function getPairKey(code1: string, code2: string): string {
+  return [normalizeCode(code1), normalizeCode(code2)].sort().join(":");
+}
+
+function broadcastPeerStatus(peerCode: string, isOnline: boolean, name?: string) {
+  const norm = normalizeCode(peerCode);
+  const payload = JSON.stringify({
+    type: "peer_status",
+    peerCode: peerCode,
+    online: isOnline,
+    name: name || "",
+  });
+
+  for (const client of activeClients.values()) {
+    if (client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(payload);
+    }
+  }
+}
+
+// REST API endpoints
+app.get("/api/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    activeUsers: activeClients.size,
+    activeSessions: activePairSessions.size,
+    timestamp: Date.now(),
+  });
+});
+
+app.get("/api/users/check/:code", (req, res) => {
+  const rawCode = req.params.code || "";
+  const norm = normalizeCode(rawCode);
+  const client = activeClients.get(norm);
+  res.json({
+    code: rawCode,
+    normCode: norm,
+    exists: !!client,
+    online: !!client && client.ws.readyState === WebSocket.OPEN,
+    name: client?.name || null,
+  });
+});
+
+app.get("/api/conversations/:myCode/:peerCode", (req, res) => {
+  const myCode = req.params.myCode || "";
+  const peerCode = req.params.peerCode || "";
+  const key = getPairKey(myCode, peerCode);
+  const history = conversationHistory.get(key) || [];
+  res.json({ messages: history.slice(-50) });
+});
+
+app.delete("/api/conversations/:myCode/:peerCode", (req, res) => {
+  const myCode = req.params.myCode || "";
+  const peerCode = req.params.peerCode || "";
+  const key = getPairKey(myCode, peerCode);
+  conversationHistory.delete(key);
+  res.json({ success: true });
+});
+
+// Digital Asset Links for Android TWA (Google Play Store verification)
+app.get("/.well-known/assetlinks.json", (_req, res) => {
+  const assetLinksPath = path.join(process.cwd(), "public", ".well-known", "assetlinks.json");
+  res.setHeader("Content-Type", "application/json");
+  res.sendFile(assetLinksPath);
+});
+
+async function startServer() {
+  const server = http.createServer(app);
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
+
+  server.on("upgrade", (request, socket, head) => {
+    const protocol = request.headers["sec-websocket-protocol"] || "";
+    // If request is from Vite HMR client or contains vite-hmr protocol, quietly destroy
+    if (
+      (typeof protocol === "string" && protocol.includes("vite-hmr")) ||
+      request.url?.includes("/@vite/") ||
+      request.url?.includes("__vite_ping")
+    ) {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws);
+    });
+  });
+
+  wss.on("connection", (ws: WebSocket) => {
+    let currentUserCode: string | null = null;
+    let currentNormCode: string | null = null;
+
+    ws.on("message", (raw: string) => {
+      try {
+        const data = JSON.parse(raw.toString());
+
+        switch (data.type) {
+          case "register": {
+            const userCode = (data.userCode || "").trim();
+            const norm = normalizeCode(userCode);
+            const name = (data.name || `User ${norm.slice(-3)}`).trim();
+
+            if (!norm) {
+              ws.send(JSON.stringify({ type: "error", message: "User code cannot be empty" }));
+              return;
+            }
+
+            currentUserCode = userCode;
+            currentNormCode = norm;
+
+            activeClients.set(norm, {
+              ws,
+              userCode,
+              normCode: norm,
+              name,
+              lastActive: Date.now(),
+            });
+
+            ws.send(
+              JSON.stringify({
+                type: "registered",
+                userCode,
+                normCode: norm,
+                name,
+                activeCount: activeClients.size,
+              })
+            );
+
+            // Notify online status
+            broadcastPeerStatus(userCode, true, name);
+            break;
+          }
+
+          case "ping": {
+            if (currentNormCode && activeClients.has(currentNormCode)) {
+              activeClients.get(currentNormCode)!.lastActive = Date.now();
+            }
+            ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
+            break;
+          }
+
+          case "check_peer": {
+            const rawPeer = (data.peerCode || "").trim();
+            const norm = normalizeCode(rawPeer);
+            const peer = activeClients.get(norm);
+            const isOnline = !!peer && peer.ws.readyState === WebSocket.OPEN;
+            ws.send(
+              JSON.stringify({
+                type: "peer_status",
+                peerCode: rawPeer,
+                online: isOnline,
+                name: peer?.name || "",
+              })
+            );
+            break;
+          }
+
+          // AnyDesk-style Connection Request
+          case "request_connection": {
+            if (!currentNormCode || !currentUserCode) {
+              ws.send(JSON.stringify({ type: "error", message: "Not registered yet" }));
+              return;
+            }
+
+            const targetRaw = (data.to || "").trim();
+            const targetNorm = normalizeCode(targetRaw);
+
+            if (!targetNorm) {
+              ws.send(JSON.stringify({ type: "request_failed", reason: "invalid_code", message: "সঠিক কোড প্রবেশ করান" }));
+              return;
+            }
+
+            if (targetNorm === currentNormCode) {
+              ws.send(JSON.stringify({ type: "request_failed", reason: "self_connection", message: "নিজের কোডে কানেকশন রিকোয়েস্ট পাঠানো যাবে না" }));
+              return;
+            }
+
+            const target = activeClients.get(targetNorm);
+            if (!target || target.ws.readyState !== WebSocket.OPEN) {
+              ws.send(
+                JSON.stringify({
+                  type: "request_failed",
+                  reason: "offline",
+                  peerCode: targetRaw,
+                  message: `কোড ${targetRaw} বর্তমানে অফলাইনে আছে বা অ্যাপ চালু নেই।`,
+                })
+              );
+              return;
+            }
+
+            const sender = activeClients.get(currentNormCode);
+            const senderName = sender?.name || currentUserCode;
+
+            // Notify target with incoming request
+            target.ws.send(
+              JSON.stringify({
+                type: "incoming_connection_request",
+                fromCode: currentUserCode,
+                fromName: senderName,
+                timestamp: Date.now(),
+              })
+            );
+
+            // Acknowledge to requester
+            ws.send(
+              JSON.stringify({
+                type: "request_sent",
+                toCode: target.userCode || targetRaw,
+                peerName: target.name,
+              })
+            );
+            break;
+          }
+
+          // User accepts incoming request
+          case "accept_connection": {
+            if (!currentNormCode || !currentUserCode) return;
+
+            const requesterRaw = (data.to || "").trim();
+            const requesterNorm = normalizeCode(requesterRaw);
+            const requester = activeClients.get(requesterNorm);
+
+            const acceptor = activeClients.get(currentNormCode);
+            const acceptorName = acceptor?.name || currentUserCode;
+
+            // Mark session as active
+            const pairKey = getPairKey(currentNormCode, requesterNorm);
+            activePairSessions.add(pairKey);
+
+            // Notify acceptor
+            ws.send(
+              JSON.stringify({
+                type: "connection_accepted",
+                peerCode: requester?.userCode || requesterRaw,
+                peerName: requester?.name || requesterRaw,
+              })
+            );
+
+            // Notify requester
+            if (requester && requester.ws.readyState === WebSocket.OPEN) {
+              requester.ws.send(
+                JSON.stringify({
+                  type: "connection_accepted",
+                  peerCode: currentUserCode,
+                  peerName: acceptorName,
+                })
+              );
+            }
+            break;
+          }
+
+          // User rejects incoming request
+          case "reject_connection": {
+            if (!currentNormCode || !currentUserCode) return;
+
+            const requesterRaw = (data.to || "").trim();
+            const requesterNorm = normalizeCode(requesterRaw);
+            const requester = activeClients.get(requesterNorm);
+
+            const rejector = activeClients.get(currentNormCode);
+            const rejectorName = rejector?.name || currentUserCode;
+
+            if (requester && requester.ws.readyState === WebSocket.OPEN) {
+              requester.ws.send(
+                JSON.stringify({
+                  type: "connection_rejected",
+                  peerCode: currentUserCode,
+                  peerName: rejectorName,
+                })
+              );
+            }
+            break;
+          }
+
+          // Requester cancels waiting request
+          case "cancel_connection_request": {
+            if (!currentNormCode || !currentUserCode) return;
+
+            const targetRaw = (data.to || "").trim();
+            const targetNorm = normalizeCode(targetRaw);
+            const target = activeClients.get(targetNorm);
+
+            if (target && target.ws.readyState === WebSocket.OPEN) {
+              target.ws.send(
+                JSON.stringify({
+                  type: "connection_request_cancelled",
+                  fromCode: currentUserCode,
+                })
+              );
+            }
+            break;
+          }
+
+          // End/Disconnect active session (AnyDesk disconnect)
+          case "disconnect_session": {
+            if (!currentNormCode || !currentUserCode) return;
+
+            const peerRaw = (data.to || "").trim();
+            const peerNorm = normalizeCode(peerRaw);
+            const pairKey = getPairKey(currentNormCode, peerNorm);
+            activePairSessions.delete(pairKey);
+
+            const peer = activeClients.get(peerNorm);
+
+            ws.send(
+              JSON.stringify({
+                type: "session_disconnected",
+                peerCode: peer?.userCode || peerRaw,
+                reason: "self_disconnected",
+              })
+            );
+
+            if (peer && peer.ws.readyState === WebSocket.OPEN) {
+              peer.ws.send(
+                JSON.stringify({
+                  type: "session_disconnected",
+                  peerCode: currentUserCode,
+                  reason: "peer_disconnected",
+                })
+              );
+            }
+            break;
+          }
+
+          case "typing": {
+            const recipientRaw = (data.to || "").trim();
+            const recipientNorm = normalizeCode(recipientRaw);
+            const target = activeClients.get(recipientNorm);
+            if (target && target.ws.readyState === WebSocket.OPEN && currentUserCode) {
+              target.ws.send(
+                JSON.stringify({
+                  type: "typing",
+                  from: currentUserCode,
+                  isTyping: !!data.isTyping,
+                })
+              );
+            }
+            break;
+          }
+
+          case "message": {
+            if (!currentUserCode || !currentNormCode) {
+              ws.send(JSON.stringify({ type: "error", message: "Not registered yet" }));
+              return;
+            }
+
+            const recipientRaw = (data.to || "").trim();
+            const recipientNorm = normalizeCode(recipientRaw);
+            const content = (data.content || "").trim();
+            const hasMedia = !!(data.mediaUrl || data.drawingData);
+
+            if (!recipientNorm || (!content && !hasMedia)) {
+              ws.send(JSON.stringify({ type: "error", message: "Recipient and message content or media required" }));
+              return;
+            }
+
+            const sender = activeClients.get(currentNormCode);
+            const senderName = sender?.name || currentUserCode;
+
+            const ttlSeconds = typeof data.ttlSeconds === 'number' && data.ttlSeconds > 0 ? data.ttlSeconds : undefined;
+            const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined;
+
+            const chatMsg: ChatMessage = {
+              id: data.id || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+              senderCode: currentUserCode,
+              senderName,
+              recipientCode: recipientRaw,
+              content,
+              msgType: data.msgType || (data.drawingData ? 'drawing' : data.mediaUrl ? 'image' : 'text'),
+              mediaUrl: data.mediaUrl,
+              mediaInfo: data.mediaInfo,
+              drawingData: data.drawingData,
+              theme: data.theme || "neon",
+              sound: data.sound !== false,
+              timestamp: Date.now(),
+              ttlSeconds,
+              expiresAt,
+            };
+
+            // Save to conversation history
+            const pairKey = getPairKey(currentNormCode, recipientNorm);
+            if (!conversationHistory.has(pairKey)) {
+              conversationHistory.set(pairKey, []);
+            }
+            const history = conversationHistory.get(pairKey)!;
+            history.push(chatMsg);
+            if (history.length > 200) history.shift();
+
+            // Deliver to recipient if connected
+            const target = activeClients.get(recipientNorm);
+            const isDelivered = target && target.ws.readyState === WebSocket.OPEN;
+
+            if (isDelivered) {
+              target.ws.send(
+                JSON.stringify({
+                  type: "new_message",
+                  message: chatMsg,
+                  isIncomingFullDisplay: true,
+                })
+              );
+            }
+
+            // Acknowledge to sender with delivery status
+            ws.send(
+              JSON.stringify({
+                type: "message_sent",
+                message: chatMsg,
+                delivered: !!isDelivered,
+              })
+            );
+            break;
+          }
+
+          case "edit_message": {
+            if (!currentUserCode || !currentNormCode) {
+              ws.send(JSON.stringify({ type: "error", message: "Not registered yet" }));
+              return;
+            }
+
+            const messageId = (data.messageId || "").trim();
+            const recipientRaw = (data.to || "").trim();
+            const recipientNorm = normalizeCode(recipientRaw);
+            const newContent = (data.newContent || "").trim();
+
+            if (!messageId || !newContent || !recipientNorm) {
+              ws.send(JSON.stringify({ type: "error", message: "Missing edit parameters" }));
+              return;
+            }
+
+            const pairKey = getPairKey(currentNormCode, recipientNorm);
+            const history = conversationHistory.get(pairKey);
+            if (history) {
+              const msg = history.find((m) => m.id === messageId);
+              if (msg && normalizeCode(msg.senderCode) === currentNormCode) {
+                msg.content = newContent;
+                msg.isEdited = true;
+                msg.editedAt = Date.now();
+              }
+            }
+
+            // Notify recipient
+            const target = activeClients.get(recipientNorm);
+            if (target && target.ws.readyState === WebSocket.OPEN) {
+              target.ws.send(
+                JSON.stringify({
+                  type: "message_edited",
+                  messageId,
+                  newContent,
+                  editedAt: Date.now(),
+                  fromCode: currentUserCode,
+                })
+              );
+            }
+
+            // Acknowledge to sender
+            ws.send(
+              JSON.stringify({
+                type: "message_edited",
+                messageId,
+                newContent,
+                editedAt: Date.now(),
+                fromCode: currentUserCode,
+              })
+            );
+            break;
+          }
+
+          case "delete_message": {
+            if (!currentUserCode || !currentNormCode) {
+              ws.send(JSON.stringify({ type: "error", message: "Not registered yet" }));
+              return;
+            }
+
+            const messageId = (data.messageId || "").trim();
+            const recipientRaw = (data.to || "").trim();
+            const recipientNorm = normalizeCode(recipientRaw);
+            const deleteForEveryone = !!data.deleteForEveryone;
+
+            if (!messageId || !recipientNorm) {
+              ws.send(JSON.stringify({ type: "error", message: "Missing delete parameters" }));
+              return;
+            }
+
+            const pairKey = getPairKey(currentNormCode, recipientNorm);
+            const history = conversationHistory.get(pairKey);
+            if (history) {
+              if (deleteForEveryone) {
+                const msgIndex = history.findIndex((m) => m.id === messageId);
+                if (msgIndex !== -1) {
+                  const msg = history[msgIndex];
+                  msg.isDeletedForEveryone = true;
+                  msg.content = "এই বার্তাটি মুছে ফেলা হয়েছে (Deleted for everyone)";
+                  msg.mediaUrl = undefined;
+                  msg.drawingData = undefined;
+                  msg.deletedAt = Date.now();
+                }
+              }
+            }
+
+            // If delete for everyone, notify recipient
+            if (deleteForEveryone) {
+              const target = activeClients.get(recipientNorm);
+              if (target && target.ws.readyState === WebSocket.OPEN) {
+                target.ws.send(
+                  JSON.stringify({
+                    type: "message_deleted",
+                    messageId,
+                    deleteForEveryone: true,
+                    fromCode: currentUserCode,
+                  })
+                );
+              }
+            }
+
+            // Acknowledge sender
+            ws.send(
+              JSON.stringify({
+                type: "message_deleted",
+                messageId,
+                deleteForEveryone,
+                fromCode: currentUserCode,
+              })
+            );
+            break;
+          }
+
+          default:
+            break;
+        }
+      } catch (err) {
+        console.error("WS message parse error:", err);
+      }
+    });
+
+    ws.on("close", () => {
+      if (currentNormCode && currentUserCode) {
+        const client = activeClients.get(currentNormCode);
+        if (client && client.ws === ws) {
+          activeClients.delete(currentNormCode);
+          broadcastPeerStatus(currentUserCode, false);
+
+          // Find active pair sessions and notify partner
+          for (const key of Array.from(activePairSessions)) {
+            if (key.includes(currentNormCode)) {
+              activePairSessions.delete(key);
+              const parts = key.split(":");
+              const otherNorm = parts[0] === currentNormCode ? parts[1] : parts[0];
+              const otherClient = activeClients.get(otherNorm);
+              if (otherClient && otherClient.ws.readyState === WebSocket.OPEN) {
+                otherClient.ws.send(
+                  JSON.stringify({
+                    type: "session_disconnected",
+                    peerCode: currentUserCode,
+                    reason: "peer_disconnected",
+                  })
+                );
+              }
+            }
+          }
+        }
+      }
+    });
+
+    ws.on("error", (err) => {
+      console.error("WS error:", err);
+    });
+  });
+
+  // Vite middleware setup
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server and WebSocket running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();

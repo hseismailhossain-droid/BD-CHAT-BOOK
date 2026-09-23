@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGradMask" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16" />
+      <stop offset="50%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#022c22" />
+    </linearGradient>
+    <linearGradient id="accentGradMask" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#06b6d4" />
+      <stop offset="50%" stop-color="#6366f1" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+  </defs>
+  <!-- Full bleed background for Android maskable icon -->
+  <rect width="512" height="512" fill="url(#bgGradMask)" />
+  
+  <!-- Content within central 80% safe zone (x: 51 to 461, y: 51 to 461) -->
+  <g transform="translate(51, 51) scale(0.8)">
+    <rect x="56" y="66" width="400" height="380" rx="44" fill="#0f172a" stroke="url(#accentGradMask)" stroke-width="10" />
+    <!-- Center Flash Icon -->
+    <path d="M266 110 L160 270 L236 270 L210 395 L330 235 L250 235 Z" fill="url(#accentGradMask)" stroke="#ffffff" stroke-width="6" stroke-linejoin="round" />
+  </g>
+</svg>
