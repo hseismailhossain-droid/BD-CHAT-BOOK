@@ -7,6 +7,7 @@ interface IncomingRequestModalProps {
   request: ConnectionRequest;
   onAccept: (fromCode: string) => void;
   onReject: (fromCode: string) => void;
+  onDismiss?: () => void;
   soundEnabled?: boolean;
 }
 
@@ -14,6 +15,7 @@ export const IncomingRequestModal: React.FC<IncomingRequestModalProps> = ({
   request,
   onAccept,
   onReject,
+  onDismiss,
   soundEnabled = true,
 }) => {
   // Play ring sound on appearance
@@ -79,7 +81,7 @@ export const IncomingRequestModal: React.FC<IncomingRequestModalProps> = ({
         </div>
 
         {/* Action Buttons: Accept / Decline */}
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-3 mb-2.5">
           <button
             id="reject-incoming-request-btn"
             type="button"
@@ -100,6 +102,16 @@ export const IncomingRequestModal: React.FC<IncomingRequestModalProps> = ({
             <span>গ্রহণ করুন</span>
           </button>
         </div>
+
+        {onDismiss && (
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="text-xs text-slate-400 hover:text-cyan-300 font-medium py-1 transition-colors"
+          >
+            পরে সিদ্ধান্ত নেব (মেসেজ রিকোয়েস্ট বক্সে রেখে দিন)
+          </button>
+        )}
       </div>
     </div>
   );
