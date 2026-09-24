@@ -182,6 +182,21 @@ export default function App() {
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const pingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
+  const soundEnabledRef = useRef(soundEnabled);
+  soundEnabledRef.current = soundEnabled;
+
+  const currentPeerCodeRef = useRef(currentPeerCode);
+  currentPeerCodeRef.current = currentPeerCode;
+
+  const sessionStatusRef = useRef(sessionStatus);
+  sessionStatusRef.current = sessionStatus;
+
+  const pendingTargetCodeRef = useRef(pendingTargetCode);
+  pendingTargetCodeRef.current = pendingTargetCode;
+
+  const autoFullDisplayRef = useRef(autoFullDisplay);
+  autoFullDisplayRef.current = autoFullDisplay;
+
   // Request system notification permission on first user interaction
   useEffect(() => {
     const handleFirstInteraction = () => {
@@ -411,36 +426,155 @@ export default function App() {
     }
   }, [identity.code]);
 
-  // 1.5 Fetch pending message / connection requests from server
+  // 1.5 Continuous Heartbeat & Request Sync Worker (Dual-Channel reliability for all networks)
   useEffect(() => {
     let isSubscribed = true;
-    const fetchRequests = async () => {
+
+    const runHeartbeat = async () => {
       try {
-        const res = await fetch(`/api/requests/${identity.code}`);
-        if (res.ok && isSubscribed) {
-          const data = await res.json();
-          if (Array.isArray(data.incoming)) {
-            setIncomingRequests(data.incoming);
-            try {
-              localStorage.setItem('bd_incoming_requests', JSON.stringify(data.incoming));
-            } catch {}
+        const res = await fetch('/api/users/heartbeat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userCode: identity.code,
+            name: identity.name,
+          }),
+        });
+
+        if (!res.ok || !isSubscribed) return;
+        const data = await res.json();
+        if (!isSubscribed) return;
+
+        // Guaranteed Online status
+        setIsConnected(true);
+        if (typeof data.activeCount === 'number' && data.activeCount > 0) {
+          setOnlineCount(data.activeCount);
+        }
+
+        // Process incoming requests
+        if (Array.isArray(data.incoming)) {
+          setIncomingRequests(data.incoming);
+          try {
+            localStorage.setItem('bd_incoming_requests', JSON.stringify(data.incoming));
+          } catch {}
+
+          if (sessionStatusRef.current === 'idle' && data.incoming.length > 0) {
+            const topReq = data.incoming[0];
+            setIncomingRequest((prev) => {
+              if (prev && normalizeCode(prev.fromCode) === normalizeCode(topReq.fromCode)) {
+                return prev;
+              }
+              if (soundEnabledRef.current) {
+                playConnectedSound();
+              }
+              if (typeof navigator !== 'undefined' && navigator.vibrate) {
+                navigator.vibrate([100, 50, 100]);
+              }
+              return topReq;
+            });
+          } else if (data.incoming.length === 0) {
+            setIncomingRequest(null);
           }
-          if (Array.isArray(data.outgoing)) {
-            setOutgoingRequests(data.outgoing);
+        }
+
+        // Process outgoing requests & active sessions
+        if (Array.isArray(data.outgoing)) {
+          setOutgoingRequests(data.outgoing);
+          try {
+            localStorage.setItem('bd_outgoing_requests', JSON.stringify(data.outgoing));
+          } catch {}
+
+          if (sessionStatusRef.current === 'requesting') {
+            if (data.activeSession && data.activeSession.connected && data.activeSession.peerCode) {
+              const peerFormatted = formatCode(data.activeSession.peerCode);
+              setSessionStatus('connected');
+              setCurrentPeerCode(peerFormatted);
+              setCurrentPeerName(data.activeSession.peerName || undefined);
+              setIsPeerOnline(true);
+              setPendingTargetCode(null);
+              setIncomingRequest(null);
+              if (soundEnabledRef.current) {
+                playConnectedSound();
+              }
+              const updated = addOrUpdatePeer({
+                code: peerFormatted,
+                name: data.activeSession.peerName || undefined,
+                lastTimestamp: Date.now(),
+              });
+              setRecentPeers(updated);
+              setSessionNotification({
+                text: `সফলভাবে ${peerFormatted}-এর সাথে সংযুক্ত হয়েছেন!`,
+                type: 'success',
+              });
+            } else if (pendingTargetCodeRef.current) {
+              const pendingNorm = normalizeCode(pendingTargetCodeRef.current);
+              const stillPending = data.outgoing.some(
+                (r: ConnectionRequest) => normalizeCode(r.toCode || '') === pendingNorm
+              );
+              if (!stillPending) {
+                setSessionStatus('idle');
+                setPendingTargetCode(null);
+                setSessionNotification({
+                  text: 'অনুরোধটি বাতিল বা প্রত্যাখ্যান করা হয়েছে।',
+                  type: 'info',
+                });
+              }
+            }
+          }
+        }
+
+        // Check connected session status & poll new messages
+        if (sessionStatusRef.current === 'connected') {
+          if (!data.activeSession || !data.activeSession.connected) {
+            setSessionStatus('idle');
+            setCurrentPeerCode(null);
+            setPendingTargetCode(null);
+            playDisconnectSound();
+            setSessionNotification({
+              text: 'সেশন সমাপ্ত হয়েছে (সংযোগ বিচ্ছিন্ন)।',
+              type: 'info',
+            });
+          } else if (currentPeerCodeRef.current) {
             try {
-              localStorage.setItem('bd_outgoing_requests', JSON.stringify(data.outgoing));
+              const convRes = await fetch(
+                `/api/conversations/${identity.code}/${currentPeerCodeRef.current}`
+              );
+              if (convRes.ok && isSubscribed) {
+                const convData = await convRes.json();
+                if (Array.isArray(convData.messages) && convData.messages.length > 0) {
+                  setMessages((prev) => {
+                    const existingIds = new Set(prev.map((m) => m.id));
+                    const newItems = convData.messages.filter((m: ChatMessage) => !existingIds.has(m.id));
+                    if (newItems.length === 0) return prev;
+                    for (const item of newItems) {
+                      saveMessageToLocal(item);
+                    }
+                    if (
+                      soundEnabledRef.current &&
+                      newItems.some((m: ChatMessage) => normalizeCode(m.senderCode) !== normalizeCode(identity.code))
+                    ) {
+                      playReceiveSound();
+                    }
+                    return [...prev, ...newItems];
+                  });
+                }
+              }
             } catch {}
           }
         }
       } catch (e) {
-        console.debug('Could not sync requests from server:', e);
+        console.debug('Heartbeat sync error:', e);
       }
     };
-    fetchRequests();
+
+    runHeartbeat();
+    const interval = setInterval(runHeartbeat, 2500);
+
     return () => {
       isSubscribed = false;
+      clearInterval(interval);
     };
-  }, [identity.code]);
+  }, [identity.code, identity.name]);
 
   // 2. Fetch past conversation history from local IndexedDB first, then server
   useEffect(() => {
@@ -573,8 +707,8 @@ export default function App() {
           case 'peer_status': {
             if (
               data.peerCode &&
-              currentPeerCode &&
-              normalizeCode(data.peerCode) === normalizeCode(currentPeerCode)
+              currentPeerCodeRef.current &&
+              normalizeCode(data.peerCode) === normalizeCode(currentPeerCodeRef.current)
             ) {
               setIsPeerOnline(!!data.online);
               if (data.name) setCurrentPeerName(data.name);
@@ -659,7 +793,7 @@ export default function App() {
                 return next;
               });
 
-              if (soundEnabled) {
+              if (soundEnabledRef.current) {
                 playConnectedSound();
               }
               if (typeof navigator !== 'undefined' && navigator.vibrate) {
@@ -678,19 +812,17 @@ export default function App() {
           case 'connection_request_cancelled': {
             const cancelledCode = data.fromCode || '';
             if (cancelledCode) {
+              const cancelledNorm = normalizeCode(cancelledCode);
               setIncomingRequests((prev) => {
-                const next = prev.filter((r) => normalizeCode(r.fromCode) !== normalizeCode(cancelledCode));
+                const next = prev.filter((r) => normalizeCode(r.fromCode) !== cancelledNorm);
                 try {
                   localStorage.setItem('bd_incoming_requests', JSON.stringify(next));
                 } catch {}
                 return next;
               });
-            }
-            if (
-              incomingRequest &&
-              normalizeCode(incomingRequest.fromCode) === normalizeCode(cancelledCode)
-            ) {
-              setIncomingRequest(null);
+              setIncomingRequest((prev) =>
+                prev && normalizeCode(prev.fromCode) === cancelledNorm ? null : prev
+              );
             }
             setSessionNotification({
               text: `${cancelledCode} অনুরোধ বাতিল করেছেন`,
@@ -725,7 +857,7 @@ export default function App() {
                 return next;
               });
 
-              if (soundEnabled) {
+              if (soundEnabledRef.current) {
                 playConnectedSound();
               }
 
@@ -759,7 +891,7 @@ export default function App() {
                 return next;
               });
             }
-            if (soundEnabled) {
+            if (soundEnabledRef.current) {
               playDisconnectSound();
             }
             setSessionNotification({
@@ -775,7 +907,7 @@ export default function App() {
             setCurrentPeerCode(null);
             setPendingTargetCode(null);
             setMessages([]);
-            if (soundEnabled) {
+            if (soundEnabledRef.current) {
               playDisconnectSound();
             }
             setSessionNotification({
@@ -788,8 +920,8 @@ export default function App() {
           case 'typing': {
             if (
               data.from &&
-              currentPeerCode &&
-              normalizeCode(data.from) === normalizeCode(currentPeerCode)
+              currentPeerCodeRef.current &&
+              normalizeCode(data.from) === normalizeCode(currentPeerCodeRef.current)
             ) {
               setIsPeerTyping(!!data.isTyping);
             }
@@ -806,8 +938,8 @@ export default function App() {
 
               // Add to message feed if connected with this peer
               if (
-                currentPeerCode &&
-                normalizeCode(senderCode) === normalizeCode(currentPeerCode)
+                currentPeerCodeRef.current &&
+                normalizeCode(senderCode) === normalizeCode(currentPeerCodeRef.current)
               ) {
                 setMessages((prev) => {
                   if (prev.some((m) => m.id === newMsg.id)) return prev;
@@ -836,7 +968,7 @@ export default function App() {
               setRecentPeers(updatedList);
 
               // Sound alert
-              if (soundEnabled) {
+              if (soundEnabledRef.current) {
                 playFullDisplayAlert(newMsg.theme || 'neon');
               }
 
@@ -847,7 +979,7 @@ export default function App() {
               });
 
               // Trigger Full Display View automatically if enabled
-              if (autoFullDisplay) {
+              if (autoFullDisplayRef.current) {
                 setIsPreviewMode(false);
                 setActiveFullDisplayMessage(newMsg);
               }
@@ -1015,11 +1147,61 @@ export default function App() {
   }, [sessionStatus, currentPeerCode, identity.code, soundEnabled]);
 
   // Request Connection to Remote Peer
-  const handleRequestConnection = (targetCode: string) => {
+  const handleRequestConnection = async (targetCode: string) => {
     const formatted = formatCode(targetCode);
+    const cleanNorm = normalizeCode(targetCode);
+    if (!cleanNorm) return;
+
+    if (cleanNorm === normalizeCode(identity.code)) {
+      setSessionNotification({
+        text: 'নিজের কোডে রিকোয়েস্ট পাঠানো যাবে না।',
+        type: 'error',
+      });
+      return;
+    }
+
     setPendingTargetCode(formatted);
     setSessionStatus('requesting');
 
+    // Immediately register in outgoing requests list
+    const newOutgoing: ConnectionRequest = {
+      fromCode: identity.code,
+      fromName: identity.name,
+      toCode: formatted,
+      timestamp: Date.now(),
+      status: 'pending',
+    };
+    setOutgoingRequests((prev) => {
+      const next = [newOutgoing, ...prev.filter((r) => normalizeCode(r.toCode || '') !== cleanNorm)];
+      try {
+        localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+
+    // 1. Guaranteed server delivery via REST API
+    try {
+      const res = await fetch('/api/requests/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromCode: identity.code,
+          fromName: identity.name,
+          toCode: formatted,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSessionNotification({
+          text: data.message || `${formatted}-এ অনুরোধ পাঠানো হয়েছে...`,
+          type: 'info',
+        });
+      }
+    } catch (e) {
+      console.debug('REST request send error:', e);
+    }
+
+    // 2. Real-time delivery via WebSocket if open
     let sentViaWs = false;
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
@@ -1031,20 +1213,15 @@ export default function App() {
       sentViaWs = true;
     }
 
-    // Always dispatch to Local P2P Mesh for offline peer discovery
+    // 3. Local P2P Mesh for same-device cross-tab communication
     localP2PMesh.sendDirectConnectionRequest(identity.code, identity.name, formatted);
-
-    setSessionNotification({
-      text: sentViaWs
-        ? `${formatted}-এ সংযোগের অনুরোধ পাঠানো হয়েছে...`
-        : `অফলাইন মোড: ${formatted}-এ সরাসরি কানেকশন রিকোয়েস্ট পাঠানো হয়েছে...`,
-      type: 'info',
-    });
   };
 
   // Cancel Pending Request
   const handleCancelRequest = () => {
     if (pendingTargetCode) {
+      const targetNorm = normalizeCode(pendingTargetCode);
+
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(
           JSON.stringify({
@@ -1053,11 +1230,26 @@ export default function App() {
           })
         );
       }
+
+      fetch('/api/requests/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromCode: identity.code, toCode: pendingTargetCode }),
+      }).catch((e) => console.debug('REST cancel error:', e));
+
       localP2PMesh.broadcast({
         type: 'mesh_cancel_request',
         fromCode: identity.code,
         toCode: pendingTargetCode,
         timestamp: Date.now(),
+      });
+
+      setOutgoingRequests((prev) => {
+        const next = prev.filter((r) => normalizeCode(r.toCode || '') !== targetNorm);
+        try {
+          localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+        } catch {}
+        return next;
       });
     }
     setSessionStatus('idle');
@@ -1065,7 +1257,7 @@ export default function App() {
   };
 
   // Accept Incoming Request
-  const handleAcceptRequest = (fromCode: string) => {
+  const handleAcceptRequest = async (fromCode: string) => {
     const formatted = formatCode(fromCode);
     const norm = normalizeCode(fromCode);
 
@@ -1081,11 +1273,19 @@ export default function App() {
     localP2PMesh.sendDirectAccept(identity.code, identity.name, formatted);
 
     // Call REST endpoint for persistent backend sync
-    fetch('/api/requests/accept', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fromCode: formatted, toCode: identity.code }),
-    }).catch((e) => console.debug('REST accept error:', e));
+    try {
+      await fetch('/api/requests/accept', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fromCode: formatted,
+          toCode: identity.code,
+          acceptorName: identity.name,
+        }),
+      });
+    } catch (e) {
+      console.debug('REST accept error:', e);
+    }
 
     // Clear from pending lists
     setIncomingRequests((prev) => {
@@ -1108,7 +1308,7 @@ export default function App() {
     setIsPeerOnline(true);
     setPendingTargetCode(null);
     setIncomingRequest(null);
-    if (soundEnabled) {
+    if (soundEnabledRef.current) {
       playConnectedSound();
     }
     const updated = addOrUpdatePeer({
@@ -1219,6 +1419,12 @@ export default function App() {
           })
         );
       }
+      fetch('/api/session/disconnect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code1: identity.code, code2: currentPeerCode }),
+      }).catch((e) => console.debug('REST disconnect error:', e));
+
       localP2PMesh.sendDirectDisconnect(identity.code, currentPeerCode);
     }
     setSessionStatus('idle');
@@ -1300,6 +1506,13 @@ export default function App() {
       );
     }
 
+    // Server-side persistent delivery fallback
+    fetch('/api/messages/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(outgoingMsg),
+    }).catch((e) => console.debug('REST message send error:', e));
+
     // Always dispatch to Local P2P Mesh for offline peer delivery
     localP2PMesh.sendDirectOfflineMessage(
       identity.code,
@@ -1368,6 +1581,13 @@ export default function App() {
         })
       );
     }
+
+    // Server-side persistent delivery fallback
+    fetch('/api/messages/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(outgoingMsg),
+    }).catch((e) => console.debug('REST message send error:', e));
 
     localP2PMesh.sendDirectOfflineMessage(
       identity.code,
@@ -1449,6 +1669,13 @@ export default function App() {
       );
     }
 
+    // Server-side persistent delivery fallback
+    fetch('/api/messages/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(outgoingMsg),
+    }).catch((e) => console.debug('REST message send error:', e));
+
     localP2PMesh.sendDirectOfflineMessage(
       identity.code,
       identity.name,
@@ -1521,6 +1748,13 @@ export default function App() {
         })
       );
     }
+
+    // Server-side persistent delivery fallback
+    fetch('/api/messages/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(outgoingMsg),
+    }).catch((e) => console.debug('REST message send error:', e));
 
     localP2PMesh.sendDirectOfflineMessage(
       identity.code,
