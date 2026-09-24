@@ -46,6 +46,7 @@ import { DrawingBoardModal } from './components/DrawingBoardModal';
 import { MediaUploadModal } from './components/MediaUploadModal';
 import { VoiceRecorderModal } from './components/VoiceRecorderModal';
 import { IncomingRequestModal } from './components/IncomingRequestModal';
+import { MessageRequestsModal } from './components/MessageRequestsModal';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { OfflineTextTransferModal } from './components/OfflineTextTransferModal';
 import { UserProfileModal } from './components/UserProfileModal';
@@ -81,6 +82,29 @@ export default function App() {
   const [currentPeerName, setCurrentPeerName] = useState<string | undefined>(undefined);
   const [pendingTargetCode, setPendingTargetCode] = useState<string | null>(null);
   const [incomingRequest, setIncomingRequest] = useState<ConnectionRequest | null>(null);
+  const [incomingRequests, setIncomingRequests] = useState<ConnectionRequest[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('bd_incoming_requests');
+        return saved ? JSON.parse(saved) : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  });
+  const [outgoingRequests, setOutgoingRequests] = useState<ConnectionRequest[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('bd_outgoing_requests');
+        return saved ? JSON.parse(saved) : [];
+      } catch {
+        return [];
+      }
+    }
+    return [];
+  });
+  const [isRequestsModalOpen, setIsRequestsModalOpen] = useState<boolean>(false);
   const [sessionNotification, setSessionNotification] = useState<{
     text: string;
     type: 'info' | 'error' | 'success';
@@ -196,10 +220,15 @@ export default function App() {
 
       switch (packet.type) {
         case 'mesh_connection_request': {
-          setIncomingRequest({
+          const req: ConnectionRequest = {
             fromCode: formatCode(packet.fromCode),
             fromName: packet.fromName || 'অপরিচিত ব্যবহারকারী',
             timestamp: packet.timestamp,
+          };
+          setIncomingRequest(req);
+          setIncomingRequests((prev) => {
+            const exists = prev.some((r) => normalizeCode(r.fromCode) === normalizeCode(req.fromCode));
+            return exists ? prev : [req, ...prev];
           });
           if (soundEnabled) {
             playConnectedSound();
@@ -218,6 +247,8 @@ export default function App() {
           setIsPeerOnline(true);
           setPendingTargetCode(null);
           setIncomingRequest(null);
+          setIncomingRequests((prev) => prev.filter((r) => normalizeCode(r.fromCode) !== fromNorm));
+          setOutgoingRequests((prev) => prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== fromNorm));
           if (soundEnabled) {
             playConnectedSound();
           }
@@ -237,6 +268,7 @@ export default function App() {
         case 'mesh_reject_connection': {
           setSessionStatus('idle');
           setPendingTargetCode(null);
+          setOutgoingRequests((prev) => prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== fromNorm));
           if (soundEnabled) {
             playDisconnectSound();
           }
@@ -248,6 +280,7 @@ export default function App() {
         }
 
         case 'mesh_cancel_request': {
+          setIncomingRequests((prev) => prev.filter((r) => normalizeCode(r.fromCode) !== fromNorm));
           if (incomingRequest && normalizeCode(incomingRequest.fromCode) === fromNorm) {
             setIncomingRequest(null);
           }
@@ -376,6 +409,37 @@ export default function App() {
         handleRequestConnection(formatted);
       }
     }
+  }, [identity.code]);
+
+  // 1.5 Fetch pending message / connection requests from server
+  useEffect(() => {
+    let isSubscribed = true;
+    const fetchRequests = async () => {
+      try {
+        const res = await fetch(`/api/requests/${identity.code}`);
+        if (res.ok && isSubscribed) {
+          const data = await res.json();
+          if (Array.isArray(data.incoming)) {
+            setIncomingRequests(data.incoming);
+            try {
+              localStorage.setItem('bd_incoming_requests', JSON.stringify(data.incoming));
+            } catch {}
+          }
+          if (Array.isArray(data.outgoing)) {
+            setOutgoingRequests(data.outgoing);
+            try {
+              localStorage.setItem('bd_outgoing_requests', JSON.stringify(data.outgoing));
+            } catch {}
+          }
+        }
+      } catch (e) {
+        console.debug('Could not sync requests from server:', e);
+      }
+    };
+    fetchRequests();
+    return () => {
+      isSubscribed = false;
+    };
   }, [identity.code]);
 
   // 2. Fetch past conversation history from local IndexedDB first, then server
@@ -518,12 +582,48 @@ export default function App() {
             break;
           }
 
+          case 'pending_requests_update': {
+            if (Array.isArray(data.incoming)) {
+              setIncomingRequests(data.incoming);
+              try {
+                localStorage.setItem('bd_incoming_requests', JSON.stringify(data.incoming));
+              } catch {}
+            }
+            if (Array.isArray(data.outgoing)) {
+              setOutgoingRequests(data.outgoing);
+              try {
+                localStorage.setItem('bd_outgoing_requests', JSON.stringify(data.outgoing));
+              } catch {}
+            }
+            break;
+          }
+
           // State 1: Request sent to remote peer
           case 'request_sent': {
             setSessionStatus('requesting');
-            setPendingTargetCode(data.toCode || null);
+            const targetCode = data.toCode || '';
+            setPendingTargetCode(targetCode || null);
+            if (targetCode) {
+              const newOutgoing: ConnectionRequest = {
+                fromCode: identity.code,
+                toCode: targetCode,
+                fromName: identity.name,
+                timestamp: Date.now(),
+              };
+              setOutgoingRequests((prev) => {
+                const filtered = prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== normalizeCode(targetCode));
+                const next = [newOutgoing, ...filtered];
+                try {
+                  localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+                } catch {}
+                return next;
+              });
+            }
             setSessionNotification({
-              text: `${data.toCode} কোডে অনুরোধ পাঠানো হয়েছে। অনুমোদনের অপেক্ষায়...`,
+              text:
+                typeof data.message === 'string'
+                  ? data.message
+                  : `${data.toCode} কোডে অনুরোধ পাঠানো হয়েছে। অনুমোদনের অপেক্ষায়...`,
               type: 'info',
             });
             break;
@@ -544,10 +644,31 @@ export default function App() {
           // State 3: Incoming Connection Request (AnyDesk incoming ring!)
           case 'incoming_connection_request': {
             if (data.fromCode) {
-              setIncomingRequest({
+              const req: ConnectionRequest = {
                 fromCode: data.fromCode,
                 fromName: data.fromName || 'User',
                 timestamp: data.timestamp || Date.now(),
+              };
+              setIncomingRequest(req);
+              setIncomingRequests((prev) => {
+                const filtered = prev.filter((r) => normalizeCode(r.fromCode) !== normalizeCode(req.fromCode));
+                const next = [req, ...filtered];
+                try {
+                  localStorage.setItem('bd_incoming_requests', JSON.stringify(next));
+                } catch {}
+                return next;
+              });
+
+              if (soundEnabled) {
+                playConnectedSound();
+              }
+              if (typeof navigator !== 'undefined' && navigator.vibrate) {
+                navigator.vibrate([100, 50, 100]);
+              }
+
+              setSessionNotification({
+                text: `🔔 ${data.fromName || data.fromCode} থেকে মেসেজ রিকোয়েস্ট এসেছে!`,
+                type: 'info',
               });
             }
             break;
@@ -555,16 +676,26 @@ export default function App() {
 
           // Remote party cancelled request before approval
           case 'connection_request_cancelled': {
-            if (
-              incomingRequest &&
-              normalizeCode(incomingRequest.fromCode) === normalizeCode(data.fromCode || '')
-            ) {
-              setIncomingRequest(null);
-              setSessionNotification({
-                text: `${data.fromCode} অনুরোধ বাতিল করেছেন`,
-                type: 'info',
+            const cancelledCode = data.fromCode || '';
+            if (cancelledCode) {
+              setIncomingRequests((prev) => {
+                const next = prev.filter((r) => normalizeCode(r.fromCode) !== normalizeCode(cancelledCode));
+                try {
+                  localStorage.setItem('bd_incoming_requests', JSON.stringify(next));
+                } catch {}
+                return next;
               });
             }
+            if (
+              incomingRequest &&
+              normalizeCode(incomingRequest.fromCode) === normalizeCode(cancelledCode)
+            ) {
+              setIncomingRequest(null);
+            }
+            setSessionNotification({
+              text: `${cancelledCode} অনুরোধ বাতিল করেছেন`,
+              type: 'info',
+            });
             break;
           }
 
@@ -572,12 +703,27 @@ export default function App() {
           case 'connection_accepted': {
             if (data.peerCode) {
               const formattedPeer = formatCode(data.peerCode);
+              const normPeer = normalizeCode(data.peerCode);
               setSessionStatus('connected');
               setCurrentPeerCode(formattedPeer);
               setCurrentPeerName(data.peerName || undefined);
               setIsPeerOnline(true);
               setPendingTargetCode(null);
               setIncomingRequest(null);
+              setIncomingRequests((prev) => {
+                const next = prev.filter((r) => normalizeCode(r.fromCode) !== normPeer);
+                try {
+                  localStorage.setItem('bd_incoming_requests', JSON.stringify(next));
+                } catch {}
+                return next;
+              });
+              setOutgoingRequests((prev) => {
+                const next = prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== normPeer);
+                try {
+                  localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+                } catch {}
+                return next;
+              });
 
               if (soundEnabled) {
                 playConnectedSound();
@@ -603,6 +749,16 @@ export default function App() {
           case 'connection_rejected': {
             setSessionStatus('idle');
             setPendingTargetCode(null);
+            const rejectedCode = data.peerCode || '';
+            if (rejectedCode) {
+              setOutgoingRequests((prev) => {
+                const next = prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== normalizeCode(rejectedCode));
+                try {
+                  localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+                } catch {}
+                return next;
+              });
+            }
             if (soundEnabled) {
               playDisconnectSound();
             }
@@ -911,6 +1067,8 @@ export default function App() {
   // Accept Incoming Request
   const handleAcceptRequest = (fromCode: string) => {
     const formatted = formatCode(fromCode);
+    const norm = normalizeCode(fromCode);
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -921,6 +1079,29 @@ export default function App() {
     }
     // Also dispatch on local P2P Mesh
     localP2PMesh.sendDirectAccept(identity.code, identity.name, formatted);
+
+    // Call REST endpoint for persistent backend sync
+    fetch('/api/requests/accept', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromCode: formatted, toCode: identity.code }),
+    }).catch((e) => console.debug('REST accept error:', e));
+
+    // Clear from pending lists
+    setIncomingRequests((prev) => {
+      const next = prev.filter((r) => normalizeCode(r.fromCode) !== norm);
+      try {
+        localStorage.setItem('bd_incoming_requests', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+    setOutgoingRequests((prev) => {
+      const next = prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== norm);
+      try {
+        localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
 
     setSessionStatus('connected');
     setCurrentPeerCode(formatted);
@@ -940,6 +1121,8 @@ export default function App() {
   // Reject Incoming Request
   const handleRejectRequest = (fromCode: string) => {
     const formatted = formatCode(fromCode);
+    const norm = normalizeCode(fromCode);
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -954,7 +1137,75 @@ export default function App() {
       toCode: formatted,
       timestamp: Date.now(),
     });
-    setIncomingRequest(null);
+
+    // Call REST endpoint
+    fetch('/api/requests/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromCode: formatted, toCode: identity.code }),
+    }).catch((e) => console.debug('REST cancel error:', e));
+
+    setIncomingRequests((prev) => {
+      const next = prev.filter((r) => normalizeCode(r.fromCode) !== norm);
+      try {
+        localStorage.setItem('bd_incoming_requests', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+
+    if (incomingRequest && normalizeCode(incomingRequest.fromCode) === norm) {
+      setIncomingRequest(null);
+    }
+
+    setSessionNotification({
+      text: `${formatted}-এর অনুরোধ বাতিল করা হয়েছে।`,
+      type: 'info',
+    });
+  };
+
+  // Cancel Outgoing / Sent Request
+  const handleCancelSentRequest = (targetCode: string) => {
+    const formatted = formatCode(targetCode);
+    const norm = normalizeCode(targetCode);
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'cancel_connection_request',
+          to: formatted,
+        })
+      );
+    }
+    localP2PMesh.broadcast({
+      type: 'mesh_cancel_request',
+      fromCode: identity.code,
+      toCode: formatted,
+      timestamp: Date.now(),
+    });
+
+    fetch('/api/requests/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fromCode: identity.code, toCode: formatted }),
+    }).catch((e) => console.debug('REST cancel error:', e));
+
+    setOutgoingRequests((prev) => {
+      const next = prev.filter((r) => normalizeCode(r.toCode || r.fromCode) !== norm);
+      try {
+        localStorage.setItem('bd_outgoing_requests', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+
+    if (pendingTargetCode && normalizeCode(pendingTargetCode) === norm) {
+      setSessionStatus('idle');
+      setPendingTargetCode(null);
+    }
+
+    setSessionNotification({
+      text: `${formatted}-এ পাঠানো অনুরোধ বাতিল করা হয়েছে।`,
+      type: 'info',
+    });
   };
 
   // Disconnect Active Session
@@ -1526,10 +1777,12 @@ export default function App() {
         isConnected={isConnected}
         onlineCount={onlineCount}
         soundEnabled={soundEnabled}
+        requestsCount={incomingRequests.length}
         onToggleSound={() => setSoundEnabled((prev) => !prev)}
         onUpdateName={handleUpdateName}
         onRegenerateCode={handleRegenerateCode}
         onOpenProfile={() => setIsProfileModalOpen(true)}
+        onOpenRequestsModal={() => setIsRequestsModalOpen(true)}
       />
 
       {/* Main Workspace */}
@@ -1543,11 +1796,17 @@ export default function App() {
             sessionStatus={sessionStatus}
             pendingTargetCode={pendingTargetCode}
             recentPeers={recentPeers}
+            incomingRequests={incomingRequests}
+            outgoingRequests={outgoingRequests}
             onRequestConnection={handleRequestConnection}
             onCancelRequest={handleCancelRequest}
             onDisconnectSession={handleDisconnectSession}
             onSelectPeer={(code) => handleRequestConnection(code)}
             onRemovePeer={handleRemovePeer}
+            onAcceptRequest={handleAcceptRequest}
+            onRejectRequest={handleRejectRequest}
+            onCancelSentRequest={handleCancelSentRequest}
+            onOpenRequestsModal={() => setIsRequestsModalOpen(true)}
             onRegenerateCode={handleRegenerateCode}
             onOpenOfflineModal={() => {
               setOfflineInitialText('');
@@ -1712,9 +1971,21 @@ export default function App() {
           request={incomingRequest}
           onAccept={handleAcceptRequest}
           onReject={handleRejectRequest}
+          onDismiss={() => setIncomingRequest(null)}
           soundEnabled={soundEnabled}
         />
       )}
+
+      {/* Dedicated Message Requests List Modal (Accept / Decline & Sent Requests) */}
+      <MessageRequestsModal
+        isOpen={isRequestsModalOpen}
+        onClose={() => setIsRequestsModalOpen(false)}
+        incomingRequests={incomingRequests}
+        outgoingRequests={outgoingRequests}
+        onAccept={handleAcceptRequest}
+        onReject={handleRejectRequest}
+        onCancelSent={handleCancelSentRequest}
+      />
 
       {/* Drawing Modal */}
       {currentPeerCode && sessionStatus === 'connected' && (
