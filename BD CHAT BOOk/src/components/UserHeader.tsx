@@ -10,6 +10,8 @@ import {
   Sparkles,
   Users,
   RefreshCw,
+  Inbox,
+  Bell,
 } from 'lucide-react';
 import { UserIdentity } from '../types';
 import { User, QrCode } from 'lucide-react';
@@ -19,10 +21,12 @@ interface UserHeaderProps {
   isConnected: boolean;
   onlineCount: number;
   soundEnabled: boolean;
+  requestsCount?: number;
   onToggleSound: () => void;
   onUpdateName: (newName: string) => void;
   onRegenerateCode?: () => void;
   onOpenProfile?: () => void;
+  onOpenRequestsModal?: () => void;
 }
 
 export const UserHeader: React.FC<UserHeaderProps> = ({
@@ -30,10 +34,12 @@ export const UserHeader: React.FC<UserHeaderProps> = ({
   isConnected,
   onlineCount,
   soundEnabled,
+  requestsCount = 0,
   onToggleSound,
   onUpdateName,
   onRegenerateCode,
   onOpenProfile,
+  onOpenRequestsModal,
 }) => {
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
@@ -283,6 +289,31 @@ export const UserHeader: React.FC<UserHeaderProps> = ({
               </button>
             )}
           </div>
+
+          {/* Message Requests Quick Button with Live Notification Badge */}
+          {onOpenRequestsModal && (
+            <button
+              id="header-message-requests-btn"
+              type="button"
+              onClick={onOpenRequestsModal}
+              className={`relative inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all shadow-sm active:scale-95 ${
+                requestsCount > 0
+                  ? 'bg-rose-950/80 border-rose-500/60 text-rose-200 hover:bg-rose-900/90 shadow-rose-500/20'
+                  : 'bg-slate-900/90 border-slate-800 text-slate-300 hover:text-white hover:bg-slate-800 hover:border-cyan-500/40'
+              }`}
+              title="মেসেজ রিকোয়েস্ট বক্স খুলুন"
+            >
+              <Inbox className={`w-4 h-4 ${requestsCount > 0 ? 'text-rose-400 animate-bounce' : 'text-cyan-400'}`} />
+              <span className="hidden sm:inline font-['Hind_Siliguri',sans-serif]">রিকোয়েস্ট</span>
+              {requestsCount > 0 ? (
+                <span className="px-1.5 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-500 text-white animate-pulse">
+                  {requestsCount}
+                </span>
+              ) : (
+                <span className="text-[10px] text-slate-500 font-mono">0</span>
+              )}
+            </button>
+          )}
 
           {/* Sound Mute Toggle */}
           <button
