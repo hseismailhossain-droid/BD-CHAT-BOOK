@@ -52,6 +52,16 @@ export function normalizeCode(raw: string): string {
 
 // In-memory state: key is normalized code (e.g. "845291736")
 const activeClients = new Map<string, ClientSession>();
+
+export interface UserPresence {
+  userCode: string;
+  normCode: string;
+  name: string;
+  lastActive: number;
+}
+// Active user presence (both WebSocket and HTTP heartbeat active users)
+const activeUsers = new Map<string, UserPresence>();
+
 // Store message history between pairs: key is sorted pair "CODEA:CODEB"
 const conversationHistory = new Map<string, ChatMessage[]>();
 // Active AnyDesk-style paired sessions: key is "CODEA:CODEB"
@@ -68,6 +78,34 @@ export interface StoredRequest {
 
 // Pending Connection / Message Requests: key is normalized toCode
 const pendingRequests = new Map<string, StoredRequest[]>();
+
+function getActiveCount(): number {
+  const now = Date.now();
+  let count = 0;
+  for (const [norm, u] of activeUsers.entries()) {
+    if (now - u.lastActive < 35000) {
+      count++;
+    } else {
+      activeUsers.delete(norm);
+    }
+  }
+  return Math.max(count, activeClients.size, 1);
+}
+
+function getActiveSessionForUser(userCode: string): { connected: boolean; peerCode: string | null; peerName: string | null } {
+  const norm = normalizeCode(userCode);
+  for (const pair of activePairSessions) {
+    const [c1, c2] = pair.split(":");
+    if (c1 === norm) {
+      const peerPres = activeUsers.get(c2) || activeClients.get(c2);
+      return { connected: true, peerCode: peerPres?.userCode || c2, peerName: peerPres?.name || c2 };
+    } else if (c2 === norm) {
+      const peerPres = activeUsers.get(c1) || activeClients.get(c1);
+      return { connected: true, peerCode: peerPres?.userCode || c1, peerName: peerPres?.name || c1 };
+    }
+  }
+  return { connected: false, peerCode: null, peerName: null };
+}
 
 function addStoredRequest(fromCode: string, fromName: string, toCode: string): StoredRequest {
   const toNorm = normalizeCode(toCode);
@@ -169,30 +207,157 @@ function broadcastPeerStatus(peerCode: string, isOnline: boolean, name?: string)
 app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
-    activeUsers: activeClients.size,
+    activeUsers: getActiveCount(),
     activeSessions: activePairSessions.size,
     timestamp: Date.now(),
   });
 });
 
+// Periodic heartbeat & presence registration for both WebSocket & non-WebSocket clients
+app.post("/api/users/heartbeat", (req, res) => {
+  const { userCode, name } = req.body;
+  if (userCode) {
+    const norm = normalizeCode(userCode);
+    activeUsers.set(norm, {
+      userCode,
+      normCode: norm,
+      name: name || `User ${norm.slice(-3)}`,
+      lastActive: Date.now(),
+    });
+  }
+
+  const activeCount = getActiveCount();
+  const rawCode = userCode || "";
+  const reqs = getUserRequests(rawCode);
+  const session = getActiveSessionForUser(rawCode);
+
+  res.json({
+    status: "ok",
+    activeCount,
+    incoming: reqs.incoming,
+    outgoing: reqs.outgoing,
+    activeSession: session,
+  });
+});
+
+// Get user incoming and outgoing connection requests
 app.get("/api/requests/:code", (req, res) => {
   const rawCode = req.params.code || "";
   const data = getUserRequests(rawCode);
-  res.json(data);
+  const session = getActiveSessionForUser(rawCode);
+  res.json({
+    ...data,
+    activeSession: session,
+  });
+});
+
+// Send a connection / message request via HTTP (reliable fallback if WebSocket is connecting/down)
+app.post("/api/requests/send", (req, res) => {
+  const { fromCode, fromName, toCode } = req.body;
+  if (!fromCode || !toCode) {
+    return res.status(400).json({ error: "fromCode and toCode required" });
+  }
+
+  const fromNorm = normalizeCode(fromCode);
+  const toNorm = normalizeCode(toCode);
+
+  if (!fromNorm || !toNorm) {
+    return res.status(400).json({ error: "সঠিক কোড প্রদান করুন" });
+  }
+
+  if (fromNorm === toNorm) {
+    return res.status(400).json({ error: "নিজের কোডে রিকোয়েস্ট পাঠানো যাবে না" });
+  }
+
+  // Update sender's presence
+  activeUsers.set(fromNorm, {
+    userCode: fromCode,
+    normCode: fromNorm,
+    name: fromName || `User ${fromNorm.slice(-3)}`,
+    lastActive: Date.now(),
+  });
+
+  const storedReq = addStoredRequest(fromCode, fromName, toCode);
+
+  // Check if target is online (via WebSocket OR recent heartbeat)
+  const targetWs = activeClients.get(toNorm);
+  const targetPres = activeUsers.get(toNorm);
+  const isWsOnline = !!targetWs && targetWs.ws.readyState === WebSocket.OPEN;
+  const isHttpOnline = !!targetPres && (Date.now() - targetPres.lastActive < 35000);
+  const isTargetOnline = isWsOnline || isHttpOnline;
+
+  // Real-time notify target via WebSocket if connected
+  if (isWsOnline && targetWs) {
+    const targetIncoming = pendingRequests.get(toNorm) || [];
+    targetWs.ws.send(
+      JSON.stringify({
+        type: "incoming_connection_request",
+        fromCode: fromCode,
+        fromName: fromName || `User ${fromNorm.slice(-3)}`,
+        timestamp: storedReq.timestamp,
+        allIncoming: targetIncoming,
+      })
+    );
+  }
+
+  // Real-time sync updates
+  notifyRequestsUpdate(fromCode);
+  notifyRequestsUpdate(toCode);
+
+  res.json({
+    success: true,
+    request: storedReq,
+    isOnline: isTargetOnline,
+    message: isTargetOnline
+      ? `${toCode} কোডে অনুরোধ সফলভাবে পৌঁছেছে। অনুমোদনের অপেক্ষায়...`
+      : `${toCode} কোডে অনুরোধ পাঠানো ও সেভ করা হয়েছে। অপর পাশের ব্যবহারকারী অন হলেই নোটিফিকেশন পাবেন।`,
+  });
 });
 
 app.post("/api/requests/accept", (req, res) => {
-  const { fromCode, toCode } = req.body;
+  const { fromCode, toCode, acceptorName } = req.body;
   if (!fromCode || !toCode) {
     return res.status(400).json({ error: "fromCode and toCode required" });
   }
   const norm1 = normalizeCode(fromCode);
   const norm2 = normalizeCode(toCode);
   removeStoredRequest(norm1, norm2);
-  activePairSessions.add(getPairKey(norm1, norm2));
+  const pairKey = getPairKey(norm1, norm2);
+  activePairSessions.add(pairKey);
+
+  const client1 = activeClients.get(norm1);
+  const client2 = activeClients.get(norm2);
+  const pres1 = activeUsers.get(norm1);
+  const pres2 = activeUsers.get(norm2);
+
+  // Notify both parties if they have open WebSocket
+  if (client1 && client1.ws.readyState === WebSocket.OPEN) {
+    client1.ws.send(
+      JSON.stringify({
+        type: "connection_accepted",
+        peerCode: toCode,
+        peerName: acceptorName || pres2?.name || toCode,
+      })
+    );
+  }
+  if (client2 && client2.ws.readyState === WebSocket.OPEN) {
+    client2.ws.send(
+      JSON.stringify({
+        type: "connection_accepted",
+        peerCode: fromCode,
+        peerName: pres1?.name || fromCode,
+      })
+    );
+  }
+
   notifyRequestsUpdate(norm1);
   notifyRequestsUpdate(norm2);
-  res.json({ success: true });
+  res.json({
+    success: true,
+    peerCode: fromCode,
+    peerName: pres1?.name || fromCode,
+    pairKey,
+  });
 });
 
 app.post("/api/requests/cancel", (req, res) => {
@@ -200,23 +365,114 @@ app.post("/api/requests/cancel", (req, res) => {
   if (!fromCode || !toCode) {
     return res.status(400).json({ error: "fromCode and toCode required" });
   }
-  removeStoredRequest(fromCode, toCode);
-  notifyRequestsUpdate(fromCode);
-  notifyRequestsUpdate(toCode);
+  const norm1 = normalizeCode(fromCode);
+  const norm2 = normalizeCode(toCode);
+  removeStoredRequest(norm1, norm2);
+
+  const client1 = activeClients.get(norm1);
+  const client2 = activeClients.get(norm2);
+
+  if (client1 && client1.ws.readyState === WebSocket.OPEN) {
+    client1.ws.send(
+      JSON.stringify({
+        type: "connection_request_cancelled",
+        fromCode: toCode,
+      })
+    );
+  }
+  if (client2 && client2.ws.readyState === WebSocket.OPEN) {
+    client2.ws.send(
+      JSON.stringify({
+        type: "connection_request_cancelled",
+        fromCode: fromCode,
+      })
+    );
+  }
+
+  notifyRequestsUpdate(norm1);
+  notifyRequestsUpdate(norm2);
   res.json({ success: true });
 });
 
+// Check if a user exists and is online
 app.get("/api/users/check/:code", (req, res) => {
   const rawCode = req.params.code || "";
   const norm = normalizeCode(rawCode);
   const client = activeClients.get(norm);
+  const presence = activeUsers.get(norm);
+  const isWsOnline = !!client && client.ws.readyState === WebSocket.OPEN;
+  const isHttpOnline = !!presence && (Date.now() - presence.lastActive < 35000);
+  const isOnline = isWsOnline || isHttpOnline;
+
   res.json({
     code: rawCode,
     normCode: norm,
-    exists: !!client,
-    online: !!client && client.ws.readyState === WebSocket.OPEN,
-    name: client?.name || null,
+    exists: !!client || !!presence,
+    online: isOnline,
+    name: client?.name || presence?.name || null,
   });
+});
+
+// Get current paired session status for a user
+app.get("/api/session/status/:code", (req, res) => {
+  const rawCode = req.params.code || "";
+  const session = getActiveSessionForUser(rawCode);
+  res.json(session);
+});
+
+// Disconnect an active paired session
+app.post("/api/session/disconnect", (req, res) => {
+  const { code1, code2 } = req.body;
+  if (code1 && code2) {
+    const pair = getPairKey(code1, code2);
+    activePairSessions.delete(pair);
+
+    const norm1 = normalizeCode(code1);
+    const norm2 = normalizeCode(code2);
+    const cl1 = activeClients.get(norm1);
+    const cl2 = activeClients.get(norm2);
+    if (cl1 && cl1.ws.readyState === WebSocket.OPEN) {
+      cl1.ws.send(JSON.stringify({ type: "session_disconnected" }));
+    }
+    if (cl2 && cl2.ws.readyState === WebSocket.OPEN) {
+      cl2.ws.send(JSON.stringify({ type: "session_disconnected" }));
+    }
+  }
+  res.json({ success: true });
+});
+
+// Send message via HTTP fallback
+app.post("/api/messages/send", (req, res) => {
+  const msg: ChatMessage = req.body;
+  if (!msg || !msg.senderCode || !msg.recipientCode) {
+    return res.status(400).json({ error: "Invalid message payload" });
+  }
+
+  const key = getPairKey(msg.senderCode, msg.recipientCode);
+  const history = conversationHistory.get(key) || [];
+  const existingIdx = history.findIndex((m) => m.id === msg.id);
+  if (existingIdx >= 0) {
+    history[existingIdx] = msg;
+  } else {
+    history.push(msg);
+  }
+  conversationHistory.set(key, history.slice(-200));
+
+  // If recipient has WS open, deliver immediately
+  const recNorm = normalizeCode(msg.recipientCode);
+  const recClient = activeClients.get(recNorm);
+  let delivered = false;
+  if (recClient && recClient.ws.readyState === WebSocket.OPEN) {
+    recClient.ws.send(
+      JSON.stringify({
+        type: "new_message",
+        message: msg,
+      })
+    );
+    delivered = true;
+  }
+
+  res.json({ success: true, delivered, message: msg });
 });
 
 app.get("/api/conversations/:myCode/:peerCode", (req, res) => {
@@ -292,13 +548,20 @@ async function startServer() {
               lastActive: Date.now(),
             });
 
+            activeUsers.set(norm, {
+              userCode,
+              normCode: norm,
+              name,
+              lastActive: Date.now(),
+            });
+
             ws.send(
               JSON.stringify({
                 type: "registered",
                 userCode,
                 normCode: norm,
                 name,
-                activeCount: activeClients.size,
+                activeCount: getActiveCount(),
               })
             );
 
@@ -333,8 +596,12 @@ async function startServer() {
           }
 
           case "ping": {
-            if (currentNormCode && activeClients.has(currentNormCode)) {
-              activeClients.get(currentNormCode)!.lastActive = Date.now();
+            if (currentNormCode) {
+              if (activeClients.has(currentNormCode)) {
+                activeClients.get(currentNormCode)!.lastActive = Date.now();
+              }
+              const u = activeUsers.get(currentNormCode);
+              if (u) u.lastActive = Date.now();
             }
             ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
             break;
