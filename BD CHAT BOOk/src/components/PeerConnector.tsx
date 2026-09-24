@@ -16,8 +16,11 @@ import {
   Sparkles,
   QrCode,
   WifiOff,
+  Inbox,
+  Bell,
+  X,
 } from 'lucide-react';
-import { PeerContact } from '../types';
+import { PeerContact, ConnectionRequest } from '../types';
 import { formatCode, normalizeCode } from '../utils/codeGenerator';
 
 export type ConnectionStatus = 'idle' | 'requesting' | 'connected';
@@ -29,11 +32,17 @@ interface PeerConnectorProps {
   sessionStatus: ConnectionStatus;
   pendingTargetCode?: string | null;
   recentPeers: PeerContact[];
+  incomingRequests?: ConnectionRequest[];
+  outgoingRequests?: ConnectionRequest[];
   onRequestConnection: (targetCode: string) => void;
   onCancelRequest: () => void;
   onDisconnectSession: () => void;
   onSelectPeer: (peerCode: string, name?: string) => void;
   onRemovePeer: (peerCode: string) => void;
+  onAcceptRequest?: (fromCode: string) => void;
+  onRejectRequest?: (fromCode: string) => void;
+  onCancelSentRequest?: (toCode: string) => void;
+  onOpenRequestsModal?: () => void;
   onRegenerateCode?: () => void;
   onOpenOfflineModal?: () => void;
 }
@@ -45,11 +54,17 @@ export const PeerConnector: React.FC<PeerConnectorProps> = ({
   sessionStatus,
   pendingTargetCode,
   recentPeers,
+  incomingRequests = [],
+  outgoingRequests = [],
   onRequestConnection,
   onCancelRequest,
   onDisconnectSession,
   onSelectPeer,
   onRemovePeer,
+  onAcceptRequest,
+  onRejectRequest,
+  onCancelSentRequest,
+  onOpenRequestsModal,
   onRegenerateCode,
   onOpenOfflineModal,
 }) => {
@@ -149,6 +164,131 @@ export const PeerConnector: React.FC<PeerConnectorProps> = ({
           <Shield className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
           <span>কেউ কানেক্ট হতে চাইলে আপনার স্ক্রিনে অনুমোদন (Accept) চাওয়ার পপআপ আসবে।</span>
         </p>
+      </div>
+
+      {/* 1.5 PENDING MESSAGE REQUESTS SECTION (ACCEPT / CANCEL) */}
+      <div className="bg-slate-950/80 border border-slate-800 rounded-2xl p-3.5 space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <Inbox className="w-4 h-4 text-cyan-400" />
+              {incomingRequests.length > 0 && (
+                <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-rose-500 animate-ping" />
+              )}
+            </div>
+            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-200">
+              মেসেজ রিকোয়েস্ট
+            </h3>
+          </div>
+
+          <button
+            type="button"
+            onClick={onOpenRequestsModal}
+            className="text-[11px] text-cyan-400 hover:text-cyan-300 font-semibold flex items-center gap-1 transition-colors"
+          >
+            <span>সব দেখুন</span>
+            {(incomingRequests.length > 0 || outgoingRequests.length > 0) && (
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-cyan-950 text-cyan-300 border border-cyan-500/40">
+                {incomingRequests.length + outgoingRequests.length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {/* Incoming Requests List with Instant Accept & Cancel */}
+        {incomingRequests.length > 0 ? (
+          <div className="space-y-2">
+            <div className="text-[11px] font-semibold text-rose-300 flex items-center gap-1">
+              <Bell className="w-3 h-3 animate-bounce text-rose-400" />
+              <span>আপনাকে পাঠানো ইনকামিং রিকোয়েস্ট ({incomingRequests.length} টি):</span>
+            </div>
+
+            {incomingRequests.map((req, idx) => {
+              const formattedFrom = formatCode(req.fromCode);
+              return (
+                <div
+                  key={req.id || `${req.fromCode}_${idx}`}
+                  className="bg-slate-900/90 border border-emerald-500/40 rounded-xl p-2.5 space-y-2 animate-in fade-in"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <span className="font-mono text-xs sm:text-sm font-extrabold text-cyan-300 tracking-wider">
+                        {formattedFrom}
+                      </span>
+                      <span className="text-[11px] text-slate-300 block truncate">
+                        {req.fromName || 'অপরিচিত ব্যবহারকারী'}
+                      </span>
+                    </div>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-500/30 font-semibold shrink-0">
+                      অনুমোদন চান
+                    </span>
+                  </div>
+
+                  {/* Accept & Cancel buttons right inside the card */}
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => onRejectRequest && onRejectRequest(req.fromCode)}
+                      className="py-1.5 px-2 rounded-lg bg-slate-950 hover:bg-rose-950/80 border border-slate-700 hover:border-rose-500 text-slate-300 hover:text-rose-200 text-[11px] font-bold flex items-center justify-center gap-1 transition-all active:scale-95"
+                      title="বাতিল করুন"
+                    >
+                      <X className="w-3 h-3 text-rose-400" />
+                      <span>বাতিল</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => onAcceptRequest && onAcceptRequest(req.fromCode)}
+                      className="py-1.5 px-2 rounded-lg bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white text-[11px] font-bold flex items-center justify-center gap-1 shadow-md shadow-emerald-500/20 transition-all active:scale-95"
+                      title="অনুরোধ গ্রহণ করুন"
+                    >
+                      <Check className="w-3 h-3" />
+                      <span>গ্রহণ করুন</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : outgoingRequests.length > 0 ? (
+          <div className="space-y-2">
+            <div className="text-[11px] font-semibold text-amber-300 flex items-center gap-1">
+              <Clock className="w-3 h-3 text-amber-400" />
+              <span>আপনার পাঠানো রিকোয়েস্ট (বিবেচনাধীন):</span>
+            </div>
+
+            {outgoingRequests.slice(0, 2).map((req, idx) => {
+              const target = req.toCode || req.fromCode;
+              return (
+                <div
+                  key={req.id || `${target}_${idx}`}
+                  className="bg-slate-900/90 border border-amber-500/30 rounded-xl p-2.5 flex items-center justify-between gap-2"
+                >
+                  <div>
+                    <span className="font-mono text-xs font-bold text-cyan-300 tracking-wider block">
+                      {formatCode(target)}
+                    </span>
+                    <span className="text-[10px] text-amber-400">অনুমোদনের অপেক্ষায়...</span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => onCancelSentRequest && onCancelSentRequest(target)}
+                    className="py-1 px-2 rounded-lg bg-slate-950 hover:bg-rose-950 border border-slate-700 hover:border-rose-500 text-slate-300 hover:text-rose-200 text-[10px] font-semibold transition-all active:scale-95"
+                  >
+                    বাতিল
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="text-center py-2 px-1">
+            <p className="text-[11px] text-slate-400 font-['Hind_Siliguri',sans-serif]">
+              বর্তমানে কোনো পেন্ডিং রিকোয়েস্ট নেই।
+            </p>
+          </div>
+        )}
       </div>
 
       {/* 2. REMOTE PEER (বন্ধুর কোড দিয়ে কানেক্ট) */}
