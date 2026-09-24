@@ -1,6 +1,0 @@
-{
-  "name": "BD CHAT BOOK",
-  "description": "BD CHAT BOOK - Real-time and offline messenger supporting unique 9-digit codes, full-display notifications, drawings, photos, videos, and voice notes.",
-  "requestFramePermissions": ["microphone", "camera"],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
