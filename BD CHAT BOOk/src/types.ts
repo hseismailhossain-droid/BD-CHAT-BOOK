@@ -57,9 +57,12 @@ export interface PeerContact {
 }
 
 export interface ConnectionRequest {
+  id?: string;
   fromCode: string;
   fromName: string;
+  toCode?: string;
   timestamp: number;
+  status?: 'pending' | 'accepted' | 'rejected' | 'cancelled';
 }
 
 export interface WebSocketMessage {
@@ -82,6 +85,7 @@ export interface WebSocketMessage {
     | 'request_sent'
     | 'request_failed'
     | 'incoming_connection_request'
+    | 'pending_requests_update'
     | 'accept_connection'
     | 'reject_connection'
     | 'connection_accepted'
@@ -100,6 +104,9 @@ export interface WebSocketMessage {
   fromCode?: string;
   fromName?: string;
   toCode?: string;
+  incoming?: ConnectionRequest[];
+  outgoing?: ConnectionRequest[];
+  allIncoming?: ConnectionRequest[];
   reason?: string;
   content?: string;
   messageId?: string;
