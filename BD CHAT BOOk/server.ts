@@ -57,6 +57,94 @@ const conversationHistory = new Map<string, ChatMessage[]>();
 // Active AnyDesk-style paired sessions: key is "CODEA:CODEB"
 const activePairSessions = new Set<string>();
 
+export interface StoredRequest {
+  id: string;
+  fromCode: string;
+  fromName: string;
+  toCode: string;
+  timestamp: number;
+  status?: 'pending' | 'accepted' | 'rejected' | 'cancelled';
+}
+
+// Pending Connection / Message Requests: key is normalized toCode
+const pendingRequests = new Map<string, StoredRequest[]>();
+
+function addStoredRequest(fromCode: string, fromName: string, toCode: string): StoredRequest {
+  const toNorm = normalizeCode(toCode);
+  const fromNorm = normalizeCode(fromCode);
+  const existing = pendingRequests.get(toNorm) || [];
+  // Remove any previous request from the exact same sender
+  const filtered = existing.filter((r) => normalizeCode(r.fromCode) !== fromNorm);
+  const req: StoredRequest = {
+    id: `req_${fromNorm}_${toNorm}_${Date.now()}`,
+    fromCode,
+    fromName: fromName || `User ${fromNorm.slice(-3)}`,
+    toCode,
+    timestamp: Date.now(),
+    status: 'pending',
+  };
+  filtered.unshift(req);
+  pendingRequests.set(toNorm, filtered.slice(0, 50));
+  return req;
+}
+
+function removeStoredRequest(code1: string, code2: string): boolean {
+  const norm1 = normalizeCode(code1);
+  const norm2 = normalizeCode(code2);
+  let removed = false;
+
+  const list1 = pendingRequests.get(norm1);
+  if (list1) {
+    const next1 = list1.filter((r) => normalizeCode(r.fromCode) !== norm2);
+    if (next1.length !== list1.length) {
+      pendingRequests.set(norm1, next1);
+      removed = true;
+    }
+  }
+
+  const list2 = pendingRequests.get(norm2);
+  if (list2) {
+    const next2 = list2.filter((r) => normalizeCode(r.fromCode) !== norm1);
+    if (next2.length !== list2.length) {
+      pendingRequests.set(norm2, next2);
+      removed = true;
+    }
+  }
+
+  return removed;
+}
+
+function getUserRequests(userCode: string) {
+  const norm = normalizeCode(userCode);
+  const incoming = pendingRequests.get(norm) || [];
+  const outgoing: StoredRequest[] = [];
+
+  for (const list of pendingRequests.values()) {
+    for (const r of list) {
+      if (normalizeCode(r.fromCode) === norm) {
+        outgoing.push(r);
+      }
+    }
+  }
+
+  return { incoming, outgoing };
+}
+
+function notifyRequestsUpdate(userCode: string) {
+  const norm = normalizeCode(userCode);
+  const client = activeClients.get(norm);
+  if (client && client.ws.readyState === WebSocket.OPEN) {
+    const reqs = getUserRequests(userCode);
+    client.ws.send(
+      JSON.stringify({
+        type: 'pending_requests_update',
+        incoming: reqs.incoming,
+        outgoing: reqs.outgoing,
+      })
+    );
+  }
+}
+
 function getPairKey(code1: string, code2: string): string {
   return [normalizeCode(code1), normalizeCode(code2)].sort().join(":");
 }
@@ -85,6 +173,37 @@ app.get("/api/health", (_req, res) => {
     activeSessions: activePairSessions.size,
     timestamp: Date.now(),
   });
+});
+
+app.get("/api/requests/:code", (req, res) => {
+  const rawCode = req.params.code || "";
+  const data = getUserRequests(rawCode);
+  res.json(data);
+});
+
+app.post("/api/requests/accept", (req, res) => {
+  const { fromCode, toCode } = req.body;
+  if (!fromCode || !toCode) {
+    return res.status(400).json({ error: "fromCode and toCode required" });
+  }
+  const norm1 = normalizeCode(fromCode);
+  const norm2 = normalizeCode(toCode);
+  removeStoredRequest(norm1, norm2);
+  activePairSessions.add(getPairKey(norm1, norm2));
+  notifyRequestsUpdate(norm1);
+  notifyRequestsUpdate(norm2);
+  res.json({ success: true });
+});
+
+app.post("/api/requests/cancel", (req, res) => {
+  const { fromCode, toCode } = req.body;
+  if (!fromCode || !toCode) {
+    return res.status(400).json({ error: "fromCode and toCode required" });
+  }
+  removeStoredRequest(fromCode, toCode);
+  notifyRequestsUpdate(fromCode);
+  notifyRequestsUpdate(toCode);
+  res.json({ success: true });
 });
 
 app.get("/api/users/check/:code", (req, res) => {
@@ -185,6 +304,31 @@ async function startServer() {
 
             // Notify online status
             broadcastPeerStatus(userCode, true, name);
+
+            // Sync pending message requests
+            notifyRequestsUpdate(userCode);
+
+            // If there is any pending incoming request for this user, trigger incoming alert
+            const incomingReqs = pendingRequests.get(norm) || [];
+            if (incomingReqs.length > 0) {
+              const latest = incomingReqs[0];
+              ws.send(
+                JSON.stringify({
+                  type: "incoming_connection_request",
+                  fromCode: latest.fromCode,
+                  fromName: latest.fromName,
+                  timestamp: latest.timestamp,
+                  allIncoming: incomingReqs,
+                })
+              );
+            }
+            break;
+          }
+
+          case "get_pending_requests": {
+            if (currentUserCode) {
+              notifyRequestsUpdate(currentUserCode);
+            }
             break;
           }
 
@@ -212,7 +356,7 @@ async function startServer() {
             break;
           }
 
-          // AnyDesk-style Connection Request
+          // AnyDesk-style Connection / Message Request
           case "request_connection": {
             if (!currentNormCode || !currentUserCode) {
               ws.send(JSON.stringify({ type: "error", message: "Not registered yet" }));
@@ -232,40 +376,44 @@ async function startServer() {
               return;
             }
 
-            const target = activeClients.get(targetNorm);
-            if (!target || target.ws.readyState !== WebSocket.OPEN) {
-              ws.send(
-                JSON.stringify({
-                  type: "request_failed",
-                  reason: "offline",
-                  peerCode: targetRaw,
-                  message: `কোড ${targetRaw} বর্তমানে অফলাইনে আছে বা অ্যাপ চালু নেই।`,
-                })
-              );
-              return;
-            }
-
             const sender = activeClients.get(currentNormCode);
             const senderName = sender?.name || currentUserCode;
+            const target = activeClients.get(targetNorm);
+            const isTargetOnline = !!target && target.ws.readyState === WebSocket.OPEN;
 
-            // Notify target with incoming request
-            target.ws.send(
-              JSON.stringify({
-                type: "incoming_connection_request",
-                fromCode: currentUserCode,
-                fromName: senderName,
-                timestamp: Date.now(),
-              })
-            );
+            // Save in persistent pending requests queue!
+            const storedReq = addStoredRequest(currentUserCode, senderName, target?.userCode || targetRaw);
 
             // Acknowledge to requester
             ws.send(
               JSON.stringify({
                 type: "request_sent",
-                toCode: target.userCode || targetRaw,
-                peerName: target.name,
+                toCode: target?.userCode || targetRaw,
+                peerName: target?.name || targetRaw,
+                isOnline: isTargetOnline,
+                message: isTargetOnline
+                  ? `${target?.userCode || targetRaw} কোডে অনুরোধ পাঠানো হয়েছে। অনুমোদনের অপেক্ষায়...`
+                  : `${targetRaw} কোডে অনুরোধ পাঠানো ও সেভ করা হয়েছে। অপর পাশের ব্যবহারকারী অ্যাপ খুললে রিকোয়েস্ট দেখতে পাবেন।`,
               })
             );
+
+            // If target is currently online, immediately send real-time incoming request alert
+            if (isTargetOnline && target) {
+              const targetIncoming = pendingRequests.get(targetNorm) || [];
+              target.ws.send(
+                JSON.stringify({
+                  type: "incoming_connection_request",
+                  fromCode: currentUserCode,
+                  fromName: senderName,
+                  timestamp: storedReq.timestamp,
+                  allIncoming: targetIncoming,
+                })
+              );
+            }
+
+            // Sync updated request lists to both parties
+            notifyRequestsUpdate(currentUserCode);
+            notifyRequestsUpdate(targetRaw);
             break;
           }
 
@@ -279,6 +427,9 @@ async function startServer() {
 
             const acceptor = activeClients.get(currentNormCode);
             const acceptorName = acceptor?.name || currentUserCode;
+
+            // Remove from pending requests
+            removeStoredRequest(currentNormCode, requesterNorm);
 
             // Mark session as active
             const pairKey = getPairKey(currentNormCode, requesterNorm);
@@ -303,6 +454,9 @@ async function startServer() {
                 })
               );
             }
+
+            notifyRequestsUpdate(currentUserCode);
+            notifyRequestsUpdate(requesterRaw);
             break;
           }
 
@@ -317,6 +471,9 @@ async function startServer() {
             const rejector = activeClients.get(currentNormCode);
             const rejectorName = rejector?.name || currentUserCode;
 
+            // Remove from pending requests
+            removeStoredRequest(currentNormCode, requesterNorm);
+
             if (requester && requester.ws.readyState === WebSocket.OPEN) {
               requester.ws.send(
                 JSON.stringify({
@@ -326,6 +483,9 @@ async function startServer() {
                 })
               );
             }
+
+            notifyRequestsUpdate(currentUserCode);
+            notifyRequestsUpdate(requesterRaw);
             break;
           }
 
@@ -337,6 +497,9 @@ async function startServer() {
             const targetNorm = normalizeCode(targetRaw);
             const target = activeClients.get(targetNorm);
 
+            // Remove from pending requests
+            removeStoredRequest(currentNormCode, targetNorm);
+
             if (target && target.ws.readyState === WebSocket.OPEN) {
               target.ws.send(
                 JSON.stringify({
@@ -345,6 +508,9 @@ async function startServer() {
                 })
               );
             }
+
+            notifyRequestsUpdate(currentUserCode);
+            notifyRequestsUpdate(targetRaw);
             break;
           }
 
